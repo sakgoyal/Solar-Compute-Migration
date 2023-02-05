@@ -1,42 +1,62 @@
-import json
-import platform
+import pickle
 import socket
-import subprocess
 import sys
+from enum import Enum, auto
+from ipaddress import IPv4Address
 
+from customWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PySide6.QtWidgets import *
 
-from customWidgets import *
-
 CURRENT_NODE = 'x'
 DEBUG = True
+PACKET = {}
+
+
+class State(Enum):
+    IDLE = auto()			# Node is idle and ready to accept
+    BUSY = auto()			# Node is busy with processes and cannot accept processes
+    MIGRATING = auto()  	# Node is migrating to another and cannot accept processes
+    SHUTDOWN = auto()		# Node is shutting down and cannot accept processes
+
+    def __str__(self):
+        if self == self.IDLE:
+            return "idle"
+        if self == self.BUSY:
+            return "busy"
+        if self == self.MIGRATING:
+            return "migrating"
+        if self == self.SHUTDOWN:
+            return "shutdown"
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, listenPort=12345, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.setMinimumSize(600, 300)
+        # self.setMinimumSize(600, 300)
+        self.setFixedSize(600, 300)     # Resizing the window horizontally breaks the alignment of the "resize button"
         self.setWindowTitle("Migration Assistant")
 
         self.title_label = QLabel("Migration Assistant", parent=self)
         self.title_label.setAlignment(Qt.AlignCenter)
         self.title_label.setStyleSheet("font-size: 40px; font-weight: bold;")
-        self.nodeSelector = NodeSelectionWidget(parent=self)
         self.powerWidget = PowerWidget(parent=self)
         self.manualMode = ManualModeWidget(parent=self)
         self.manualButtons = ManualButtonsWidget(parent=self)
+        self.nodeSelector = NodeSelectionWidget(parent=self)
         self.stateText = CurrentStateWidget(parent=self)
 
-        self.layout = QGridLayout(parent=self)
+        self.layout = QGridLayout()
+        # self.layout = QGridLayout(parent=self)        # It appears (parent=self) generates a warning
         self.layout.addWidget(self.title_label, 0, 0, 1, 4)
         self.layout.addWidget(self.nodeSelector, 1, 0, 1, 3)
         self.layout.addWidget(self.powerWidget, 2, 0)
         self.layout.addWidget(self.manualMode, 2, 1)
         self.layout.addWidget(self.stateText, 3, 0)
         self.layout.addWidget(self.manualButtons, 3, 1)
-        self.layoutWidget = QWidget(parent=self)
+        self.layoutWidget = QWidget()
+        # self.layoutWidget = QWidget(parent=self)      # It appears (parent=self) generates a warning
         self.layoutWidget.setLayout(self.layout)
         self.setCentralWidget(self.layoutWidget)
 
@@ -45,52 +65,56 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.worker.stop()
-        self.worker.wait()
+        self.worker.wait(deadline=500)
         return super().closeEvent(event)
 
 
 class asyncWorker(QThread):
     """This class is used to listen for incoming broadcast status packets from the nodes for the HMI to display"""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
         self._running = True
 
     def stop(self):
         self._running = False
 
     def run(self, listenPort=12345, sockSize=512):
-        global CURRENT_NODE
+        global CURRENT_NODE, PACKET
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # Create a UDP socket
-        sock.settimeout(1)  # Set a timeout for 1 second so the socket doesn't block indefinately when closing the program
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow multiple sockets to use the same PORT number
+        sock.settimeout(0.3)  # Set a timeout so the socket doesn't block indefinitely when trying to receive data
         sock.bind(('', listenPort))  # Listen on all interfaces on port 12345 for broadcast packets
         self._running = True
 
         while self._running:
             try:
-                packet = json.loads(sock.recvfrom(sockSize)[0].decode('utf-8'))
-                if CURRENT_NODE in packet['ip']:  # TODO: Fix this if statement (if the packet is from the currently selected node). This is a hacky way to do it
-                    mWindow.nodeSelector.address.setText(packet['ip'])
-                    mWindow.powerWidget.power.setText(f"{packet['current']*packet['voltage']} W")
-                    mWindow.stateText.stateText.setText(packet['state'])
+                PACKET = pickle.loads(sock.recvfrom(sockSize)[0])
+                if CURRENT_NODE in PACKET['ip']:  # TODO: Fix this if statement (if the packet is from the currently selected node). This is a hacky way to do it
+                    mWindow.nodeSelector.address.setText(PACKET['ip'])
+                    mWindow.powerWidget.power.setText(f"{PACKET['current']*PACKET['voltage']} W")
+                    mWindow.stateText.stateText.setText(str(PACKET['state']))
                     if DEBUG:
-                        print(f"State for Node {CURRENT_NODE} is {packet}")
-            except:
+                        print(f"State for Node {CURRENT_NODE} is {PACKET}")
+            except socket.timeout:
+                pass
+            except Exception as e:
+                print(e)
                 pass
 
 
 class PowerWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
-        self.label = QLabel("Input Power: ")
+        self.label = QLabel("Input Power: ", parent=parent)
 
-        self.power = QLineEdit(self)
-        self.power.setText('Select a Node')
+        self.power = QLineEdit('Select a Node', self)
         self.power.setAlignment(Qt.AlignCenter)
         self.power.setStyleSheet("color: grey; border-radius: 10px; border: 1px solid grey;")
         self.power.setReadOnly(True)
+        self.power.setToolTip("The current input power to the selected node in Watts")
 
-        self.layout = QHBoxLayout()
+        self.layout = QHBoxLayout(self)
         self.layout.addWidget(self.label, 0)
         self.layout.addWidget(self.power, 1)
         self.setLayout(self.layout)
@@ -100,33 +124,48 @@ class RefreshWidget(QWidget):
     def __init__(self, parent=None, size=20):
         super().__init__(parent=parent)
 
-        self.button = QPushButton(icon=QIcon('refresh.png'), parent=self)
+        self.button = QPushButton(icon=QIcon('images/refresh.png'), parent=self)
         self.button.setIconSize(QSize(size, size))
-        # self.button.connect(self.button, SIGNAL('clicked()'), self.refreshNodesList) # FIX THE FUNCTION FIRST
+        # self.button.clicked.connect(self.refreshNodesList)# FIX THE FUNCTION FIRST
 
-    def refreshNodesList(self) -> None:  # could potentially change so instead of active scan, wait and listen for broadcast messages instead.
-        if platform.system() != 'Linux':
-            print('This program is only supported on Linux')  # TODO: This is a problem. Should work everywhere
-            return
-        global nodeIPs
-        nodeIPs = []
+        self.movie = QMovie("images/refresh.gif")
+        self.movie.frameChanged.connect(self.update_icon)
+        self.button.clicked.connect(self.play_gif)
 
-        # -------------------- change so it works in any situation. currently only works when connected to nodes directly on ethernet --------------------
-        # -------------------- if any other devices is connected to the network, it will be added to the list when it should not --------------------
+    def refreshNodesList(self) -> None:
+        """
+        # global nodeIPs
+        # nodeIPs = []
 
-        output = subprocess.run(['ip', 'route'], capture_output=True, text=True).stdout.splitlines()
-        gateIP = output[0].split(' ')[2]  # get the gateway ip of the current network
-        cidr = output[1].split(' ')[0]  # get the cidr of the current network
+        # # -------------------- change so it works in any situation. currently only works when connected to nodes directly on ethernet --------------------
+        # # -------------------- if any other devices is connected to the network, it will be added to the list when it should not --------------------
+        # # -------------------- could be fixed by passively listening for broadcast messages instead. but this way you cant choose offline nodes  ---------
 
-        lines = subprocess.run(['sudo', 'arp-scan', cidr, '-x', '-q', '-g'], capture_output=True, text=True).stdout.splitlines()
-        for line in lines:  # for every found node in the network
-            nodeIPs.append(line.split('\t')[0])  # add the ip of that node to the list
-        print(nodeIPs)
+        # output = subprocess.run(['ip', 'route'], capture_output=True, text=True).stdout.splitlines()
+        # gateIP = output[0].split(' ')[2]  # get the gateway ip of the current network
+        # cidr = output[1].split(' ')[0]  # get the cidr of the current network
 
-        if selfIP in nodeIPs:
-            nodeIPs.remove(selfIP)  # removing my own ip from the list
-        if gateIP in nodeIPs:
-            nodeIPs.remove(gateIP)  # removing gateway ip from the list
+        # lines = subprocess.run(['sudo', 'arp-scan', cidr, '-x', '-q', '-g'], capture_output=True, text=True).stdout.splitlines()
+        # for line in lines:  # for every found node in the network
+        #     nodeIPs.append(line.split('\t')[0])  # add the ip of that node to the list
+        # print(nodeIPs)
+
+        # if selfIP in nodeIPs:
+        #     nodeIPs.remove(selfIP)  # removing my own ip from the list
+        # if gateIP in nodeIPs:
+        #     nodeIPs.remove(gateIP)  # removing gateway ip from the list
+        """
+        pass
+
+    def play_gif(self):
+        if self.movie.state() == QMovie.Running:
+            self.movie.stop()
+            self.button.setIcon(QPixmap("images/refresh.png"))
+        else:
+            self.movie.start()
+
+    def update_icon(self):
+        self.button.setIcon(self.movie.currentPixmap())
 
 
 class ManualModeWidget(QWidget):
@@ -136,8 +175,11 @@ class ManualModeWidget(QWidget):
 
         self.check = QToggleSwitch(parent=self)
         self.check.toggled.connect(self.on_toggled)
+        self.check.setChecked(False)
+        self.check.setEnabled(False)
+        self.check.setToolTip("Please select a node first")
 
-        self.layout = QHBoxLayout()
+        self.layout = QHBoxLayout(self)
         self.layout.addWidget(self.label, 0, Qt.AlignRight)
         self.layout.addWidget(self.check, 1)
         self.setLayout(self.layout)
@@ -145,6 +187,11 @@ class ManualModeWidget(QWidget):
     def on_toggled(self, state):
         mWindow.manualButtons.setEnabled(state)
         # print(f"Manual Mode {'Enabled' if state else 'Disabled'}")
+
+        if state:
+            mWindow.manualMode.check.setToolTip("Slide to disable manual mode")
+        else:
+            mWindow.manualMode.check.setToolTip("Slide to enable manual mode")
 
 
 class NodeSelectionWidget(QWidget):
@@ -157,21 +204,23 @@ class NodeSelectionWidget(QWidget):
         self.combo_box.currentIndexChanged.connect(self.combo_box_index_changed)
         # self.combo_box.setStyleSheet("color: grey; border-radius: 1px; border: 1px solid grey;")
 
-        self.refreshbutton = RefreshWidget(parent=self)
+        self.refreshButton = RefreshWidget(parent=self)
+        self.refreshButton.setToolTip("Update the nodes available")
 
-        self.label = QLabel("Currently viewing:")
-
+        self.label1 = QLabel("Currently viewing:")
         self.label2 = QLabel("IP of Node: ")
+
         self.address = QLineEdit(self)
         self.address.setText('Select a Node')
         self.address.setReadOnly(True)
         self.address.setAlignment(Qt.AlignCenter)
         self.address.setStyleSheet("color: grey;border-radius: 10px; border: 1px solid grey;")
+        self.address.setToolTip("The IP address of the selected node")
 
         self.layout = QHBoxLayout()
-        self.layout.addWidget(self.label, 0)
+        self.layout.addWidget(self.label1, 0)
         self.layout.addWidget(self.combo_box, 1)
-        self.layout.addWidget(self.refreshbutton, 2)
+        self.layout.addWidget(self.refreshButton, 2)
         self.layout.addWidget(self.label2, 3, Qt.AlignRight)
         self.layout.addWidget(self.address, 4)
         self.setLayout(self.layout)
@@ -179,14 +228,27 @@ class NodeSelectionWidget(QWidget):
     def combo_box_index_changed(self):
         global CURRENT_NODE
         CURRENT_NODE = self.combo_box.currentText()
+
+        # Every time we pick a new node, the slider should be unchecked
+        mWindow.manualMode.check.setChecked(False)
+
         if CURRENT_NODE != "Select a Node":
             self.address.setText('Loading...')
             mWindow.stateText.stateText.setText('Loading...')
             mWindow.powerWidget.power.setText('Loading...')
+            mWindow.manualMode.check.setEnabled(True)
+
+            # Even if the slider is checked, the below text will be read if index is changed (we have made it so
+            # that slider becomes unchecked every time "combo_box_index_changed" is called so we should be fine)
+            mWindow.manualMode.check.setToolTip("Slide to enable manual mode")
         else:
             self.address.setText('Select a Node')
             mWindow.stateText.stateText.setText('Select a Node')
             mWindow.powerWidget.power.setText('Select a Node')
+            mWindow.manualMode.check.setChecked(False)
+            mWindow.manualMode.check.setEnabled(False)
+            mWindow.manualMode.check.setToolTip("Please select a node first")
+
         print(f"Selected Node: {CURRENT_NODE}")  # Print the selected item's index to the console
 
 
